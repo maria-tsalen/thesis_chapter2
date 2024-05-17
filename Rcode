@@ -1,0 +1,1095 @@
+#load libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "./path/to/files/")
+library(edgeR)
+library(ChIPseeker)
+library(EnhancedVolcano)
+library(ggplot2)
+library(DESeq2)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(dplyr)
+library("tximport")
+library("readr")
+library("tximportData")
+library(gplots)
+library(magrittr)
+library(ggrepel)
+library(gprofiler2)
+library(org.Hs.eg.db)
+library(ghibli)
+library(tidyverse)
+library(DEGreport)
+library(clusterProfiler)
+library(scales)
+library(stringr)
+library(tibble)
+library(paletteer)
+library(pheatmap)
+```
+#ChIP-seq read in peaks and counts
+```{r}
+load(file = "./path/to/files/chip/SH_chip_peaks_counts.rda")
+sample_sheet <- read.table("./path/to/files/chip/samples_info_chip.csv", header = T, sep = ",")
+sample_sheet <- sample_sheet[sample_sheet$mapped_reads >= 9e6, ]
+sample_sheet <- sample_sheet[!sample_sheet$batch %in% "1",]
+#sample_sheet <- sample_sheet[!sample_sheet$ID %in% c("IGF131221","IGF124724"), ]
+chip_counts <- counts[,2:39]
+
+#remove <-c("IGF131221","IGF124724")
+#chip_counts <- chip_counts[,!colnames(chip_counts) %in% remove]
+ 
+#renaming columns
+names_vector <- setNames(sample_sheet$samples_name, sample_sheet$ID)
+new_colnames <- names_vector[names(names_vector) %in% colnames(counts)]
+ordered_new_colnames <- new_colnames[colnames(counts)]
+colnames(counts) <- ordered_new_colnames
+
+chip_ss <- sample_sheet
+chip_peaks <- peaks
+rm(names_vector, new_colnames, ordered_new_colnames, sample_sheet,peaks,counts)
+
+group <- chip_ss$group
+design <- model.matrix(~group)
+keep <- filterByExpr(chip_counts, design)
+chip_counts <- chip_counts[keep,]
+```
+#RNA-seq read in counts
+```{r}
+workDir <- file.path("./path/to/files/rna/")
+
+#read in samples and ensure that the control is vehicle
+rna_ss = read.csv(paste0(workDir, "/samples_info.csv"))
+
+#remove samples IGF128370 IGF128374 IGF128356 due to low read count
+rna_ss <- rna_ss[!rna_ss$sample_ID %in% c("IGF128370", "IGF128374", "IGF128356","IGF128389","IGF131381"), ]
+
+#
+#direct to the correct files
+files = file.path(workDir, rna_ss$sample_ID, "quant.sf")
+names(files) <- rna_ss$sample_name
+
+tx2gene = read.csv(paste0(workDir, "/tx2gene.csv"), sep="")
+
+#import files into DESeqDataSet
+txi = tximport(files, type="salmon", tx2gene=tx2gene, ignoreTxVersion=TRUE)
+
+rm(files, workDir,tx2gene)
+```
+#PCA ChIP
+```{r}
+group <- chip_ss$group
+
+dds <- DESeqDataSetFromMatrix(countData = chip_counts,
+                              colData = chip_ss,
+                              design = ~ group)
+dds <- DESeq(dds)
+normalized_counts <- counts(dds, normalized = TRUE)
+
+# Perform PCA on the normalized data
+pca_res <- prcomp(t(log1p(normalized_counts)))
+
+# Extract PCA results
+pca_data <- as.data.frame(pca_res$x)
+
+# Calculate percentage of variance explained by each principal component
+percentVar <- pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
+
+# Assuming your metadata$condition contains the original condition names
+# Map original condition names to new names
+chip_ss$group <- factor(chip_ss$group,
+                             levels = c("Vehicle_Day_1", "Vehicle_Day_5", "Vehicle_Day_30", "Rotenone_Day_1","Rotenone_Day_5","Rotenone_Day_30"),
+                             labels = c("Vehicle Day 1", "Vehicle Day 5", "Vehicle Day 30", "Rotenone Day 1","Rotenone Day 5","Rotenone Day 30"))
+
+# Define custom colors with the new condition names
+custom_colors <- c("Vehicle Day 1"= "#A6A0A0FF", 
+                   "Vehicle Day 5"="#ADB7C0FF", 
+                   "Vehicle Day 30"="#94C5CCFF", 
+                   "Rotenone Day 1"="#F4ADB3FF",
+                   "Rotenone Day 5"="#EEBCB1FF",
+                   "Rotenone Day 30"="#ECD89DFF")
+
+# Update pca_data with the new condition names from updated metadata
+sample_order <- chip_ss$ID
+pca_data$condition <- chip_ss$group[match(rownames(pca_data), sample_order)]
+
+
+# Plot PCA using ggplot2 with custom colors and renamed legend entries
+pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", round(pca_res$sdev[1] ^ 2 / sum(pca_res$sdev ^ 2) * 100, 2), "% variance")) +
+  ylab(paste0("PC2: ", round(pca_res$sdev[2] ^ 2 / sum(pca_res$sdev ^ 2) * 100, 2), "% variance")) +
+  scale_color_manual(values = custom_colors, name = NULL) +  
+  theme_classic() +
+  theme(
+    axis.text.x = element_blank(),  
+    axis.ticks.x = element_blank(),  
+    plot.title = element_text(hjust = 0.5, size = 0),  
+    axis.title = element_text(size = 14),  
+    axis.text = element_text(size = 12),  
+    legend.text = element_text(size = 12),  
+    legend.title = element_text(size = 0),   
+    axis.line.x = element_line(color = "black")  
+  ) 
+pca_plot
+
+# Calculate Mahalanobis distances
+mahalanobis_dist <- mahalanobis(pca_data[, c("PC1", "PC2")], colMeans(pca_data[, c("PC1", "PC2")]), cov(pca_data[, c("PC1", "PC2")]))
+
+# Determine threshold for outliers (e.g., using chi-square distribution)
+threshold <- qchisq(0.99, df = 2) # Adjust the significance level as needed
+
+# Identify outliers
+outliers <- which(mahalanobis_dist > threshold)
+
+# Print outliers
+print(pca_data[outliers, ])
+
+# Plot PCA with outliers highlighted
+pca_plot + geom_point(data = pca_data[outliers, ], aes(x = PC1, y = PC2), color = "red", size = 3)
+
+ggsave("~/Desktop/chronic_analysis/figures/chip_pca.png", pca_plot, dpi= 300)
+```
+#PCA RNA
+```{r}
+group <- rna_ss$group
+
+#import data into DESeqDataSet
+
+dds = DESeqDataSetFromTximport(txi, colData = rna_ss, design = ~  group)
+dds <- DESeq(dds)
+
+normalized_counts <- counts(dds, normalized = TRUE)
+
+# Perform PCA on the normalized data
+pca_res <- prcomp(t(log1p(normalized_counts)))
+
+# Extract PCA results
+pca_data <- as.data.frame(pca_res$x)
+# Calculate percentage of variance explained by each principal component
+percentVar <- pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
+
+rna_ss$group <- factor(rna_ss$group,
+                             levels = c("Vehicle_Day_1", "Vehicle_Day_5", "Vehicle_Day_30", "Rotenone_Day_1","Rotenone_Day_5","Rotenone_Day_30"),
+                             labels = c("Vehicle Day 1", "Vehicle Day 5", "Vehicle Day 30", "Rotenone Day 1","Rotenone Day 5","Rotenone Day 30"))
+
+# Define custom colors with the new condition names
+custom_colors <- c("Vehicle Day 1"= "#A6A0A0FF", 
+                   "Vehicle Day 5"="#ADB7C0FF", 
+                   "Vehicle Day 30"="#94C5CCFF", 
+                   "Rotenone Day 1"="#F4ADB3FF",
+                   "Rotenone Day 5"="#EEBCB1FF",
+                   "Rotenone Day 30"="#ECD89DFF")
+
+# Update pca_data with the new condition names from updated metadata
+sample_order <- rna_ss$sample_name
+pca_data$condition <- rna_ss$group[match(rownames(pca_data), sample_order)]
+#pca_data$batch <- rna_ss$batch[match(rownames(pca_data), sample_order)]
+
+# Plot PCA using ggplot2 with custom colors and renamed legend entries
+pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", round(pca_res$sdev[1] ^ 2 / sum(pca_res$sdev ^ 2) * 100, 2), "% variance")) +
+  ylab(paste0("PC2: ", round(pca_res$sdev[2] ^ 2 / sum(pca_res$sdev ^ 2) * 100, 2), "% variance")) +
+  scale_color_manual(values = custom_colors, name = NULL) +  
+  theme_classic() +
+  theme(
+    axis.text.x = element_blank(),  
+    axis.ticks.x = element_blank(),  
+    plot.title = element_text(hjust = 0.5, size = 0),  
+    axis.title = element_text(size = 14),  
+    axis.text = element_text(size = 12),  
+    legend.text = element_text(size = 12),  
+    legend.title = element_text(size = 0),   
+    axis.line.x = element_line(color = "black")  
+  ) 
+pca_plot
+# Calculate Mahalanobis distances
+mahalanobis_dist <- mahalanobis(pca_data[, c("PC1", "PC2")], colMeans(pca_data[, c("PC1", "PC2")]), cov(pca_data[, c("PC1", "PC2")]))
+
+# Determine threshold for outliers (e.g., using chi-square distribution)
+threshold <- qchisq(0.99, df = 2) # Adjust the significance level as needed
+
+# Identify outliers
+outliers <- which(mahalanobis_dist > threshold)
+
+# Print outliers
+print(pca_data[outliers, ])
+
+# Plot PCA with outliers highlighted
+pca_plot + geom_point(data = pca_data[outliers, ], aes(x = PC1, y = PC2), color = "red", size = 3)
+#ggsave("~/Desktop/chronic_analysis/figures/rna_pca.png", pca_plot, dpi= 300)
+```
+
+#Wald DE RNA
+```{r}
+dds.WR <- DESeqDataSetFromTximport(txi, rna_ss, design = ~ group)
+dds.WR <- DESeq(dds.WR, test = "Wald")
+#This is minimum #samples that have >= 10 counts in a row (i.e. per gene)
+smallestSample <- 7 
+keep <- rowSums (counts(dds.WR) >= 10) >= smallestSample
+dds.WR <- dds.WR[keep,]
+
+res30.WR <- results(object = dds.WR, contrast = c("group", "Rotenone_Day_30", "Vehicle_Day_30"), alpha = 0.05)
+res30.WR <- as.data.frame(res30.WR)
+res5.WR <- results(object = dds.WR, contrast = c("group", "Rotenone_Day_5", "Vehicle_Day_5"), alpha = 0.05)
+res5.WR <- as.data.frame(res5.WR)
+
+#load gene annotation
+library(biomaRt)
+
+ensembl_ids <- row.names(res30.WR)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Get gene symbols using the Ensembl IDs
+genes_info <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name'),
+                    filters = 'ensembl_gene_id',
+                    values = ensembl_ids,
+                    mart = ensembl)
+
+res30.WR <- merge(res30.WR, genes_info, by.x = "row.names", by.y = "ensembl_gene_id")
+res30.WR$padj <- p.adjust(res30.WR$pvalue, method="fdr")
+
+res30.WR <- res30.WR %>%
+  rename(logFC = log2FoldChange)
+
+res5.WR <- merge(res5.WR, genes_info, by.x = "row.names", by.y = "ensembl_gene_id")
+res5.WR$padj <- p.adjust(res5.WR$pvalue, method="fdr")
+
+res5.WR <- res5.WR %>%
+  rename(logFC = log2FoldChange)
+
+sig.genes.rna_30 <- res30.WR %>%
+  filter((logFC > 0 | logFC < 0) & padj < 0.05)
+sum(sig.genes.rna_30$logFC < 0) #hypo
+sum(sig.genes.rna_30$logFC > 0) #hyper
+sig.genes.rna_5 <- res5.WR %>%
+  filter((logFC > 0 | logFC < 0) & padj < 0.05)
+sum(sig.genes.rna_5$logFC < 0) #hypo
+sum(sig.genes.rna_5$logFC > 0) #hyper
+```
+#Wald day 30 RNA volplot
+```{r}
+res30.WR.plot <- EnhancedVolcano(res30.WR, 
+                lab = res30.WR$external_gene_name,
+                x= "logFC", 
+                y = "padj",
+                ylab = '-log10(FDR)',
+                title = 'Day 30 RNA-seq',
+                subtitle = NULL,
+                pCutoff = 0.05,
+                FCcutoff = 0.5,
+                pointSize = 2.0,
+                labSize = 3.5,
+                col=c("#E8C4A2FF","#D8AF39FF","#DE7862FF","#278B9AFF"),
+                boxedLabels = TRUE,
+                drawConnectors = TRUE,
+                widthConnectors = 0.5,
+                #selectLab = c("PNPLA3","FDFT1","INSIG1","GNG8","HMGCR","H3P16","MTCO3P12"),
+                xlim = c(-11,11),
+                maxoverlapsConnectors = 20,
+                caption = "")
+res30.WR.plot <- res30.WR.plot + theme_classic() +
+  theme(axis.title = element_text(size = 16), 
+        axis.text = element_text(size = 16),  
+        axis.line.x = element_line(color = "black"),  
+        legend.position = "none",
+        plot.title = element_text(size = 16, hjust = 0.5))
+res30.WR.plot
+#ggsave("~/Desktop/chronic_analysis/figures/rna_volplot.png",res30.WR.plot, dpi= 300, width = 10)
+```
+
+#Wald DE ChIP
+```{r}
+counts_rownames <- rownames(chip_counts)
+chip_peaks <- chip_peaks[chip_peaks$Peak %in% counts_rownames, ]
+chip_annot <- as.data.frame(annotatePeak(makeGRangesFromDataFrame(chip_peaks[,1:3]), 
+                                            TxDb = TxDb.Hsapiens.UCSC.hg38.knownGene,
+                                            tssRegion=c(-3000, 3000), annoDb="org.Hs.eg.db"))
+chip_annot$ID <- paste(chip_annot$start, sep=".", chip_annot$end)
+chip_peaks$ID <- paste(chip_peaks$Start, sep=".", chip_peaks$End)
+m <- chip_peaks$ID %in% chip_annot$ID
+chip_peaks <- chip_peaks[m,]
+row.names(chip_annot) <- chip_peaks$Peak
+
+#group should not be a factor at this point
+dds.WC <- DESeqDataSetFromMatrix(chip_counts, colData = chip_ss, design = ~ group)
+dds.WC <- DESeq(dds.WC, test = "Wald")
+#This is minimum #samples that have >= 10 counts in a row (i.e. per gene)
+smallestSample <- 5 
+keep <- rowSums (counts(dds.WC) >= 10) >= smallestSample
+dds.WC <- dds.WC[keep,]
+
+res30.WC <- results(object = dds.WC, contrast = c("group", "Rotenone_Day_30", "Vehicle_Day_30"), alpha = 0.05)
+res30.WC <- as.data.frame(res30.WC)
+res30.WC$padj <- p.adjust(res30.WC$pvalue, method="fdr")
+
+res5.WC <- results(object = dds.WC, contrast = c("group", "Rotenone_Day_5", "Vehicle_Day_5"), alpha = 0.05)
+res5.WC <- as.data.frame(res5.WC)
+res5.WC$padj <- p.adjust(res5.WC$pvalue, method="fdr")
+
+
+res30.WC <- merge(res30.WC, chip_annot[,c(1:3,14,16,17)], by = "row.names")
+res30.WC <- res30.WC %>% mutate(DAR = ifelse(log2FoldChange > 0 & padj < 0.05, "Hyper",
+              ifelse(log2FoldChange < 0 & padj < 0.05, "Hypo", "non-DAR"))) %>% arrange(pvalue)
+res30.WC$DAR <- factor(res30.WC$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+res30.WC <- res30.WC %>%
+  rename(logFC = log2FoldChange)
+
+res5.WC <- merge(res5.WC, chip_annot[,c(1:3,14,16,17)], by = "row.names")
+res5.WC <- res5.WC %>% mutate(DAR = ifelse(log2FoldChange > 0 & padj < 0.05, "Hyper",
+              ifelse(log2FoldChange < 0 & padj < 0.05, "Hypo", "non-DAR"))) %>% arrange(pvalue)
+res5.WC$DAR <- factor(res5.WC$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+
+res5.WC <- res5.WC %>%
+  rename(logFC = log2FoldChange)
+
+sig.genes.chip_30 <- res30.WC %>%
+  filter((logFC > 0 | logFC < 0) & padj < 0.05)
+sum(sig.genes.chip_30$logFC < 0) #hypo
+sum(sig.genes.chip_30$logFC > 0) #hyper
+sig.genes.chip_5 <- res5.WC %>%
+  filter((logFC > 0 | logFC < 0) & padj < 0.05)
+sum(sig.genes.chip_5$logFC < 0) #hypo
+sum(sig.genes.chip_5$logFC > 0) #hyper
+```
+#Wald day 30 ChIP volplot
+```{r}
+res30.WC.plot <- EnhancedVolcano(res30.WC, 
+                lab = res30.WC$SYMBOL,
+                x= "logFC", 
+                y = "padj",
+                ylab = '-log10(FDR)',
+                title = 'Day 30 ChIP-seq',
+                subtitle = NULL,
+                pCutoff = 0.05,
+                FCcutoff = 0.5,
+                pointSize = 2.0,
+                labSize = 3.5,
+                col=c("#E8C4A2FF","#D8AF39FF","#DE7862FF","#278B9AFF"),
+                boxedLabels = TRUE,
+                drawConnectors = TRUE,
+                widthConnectors = 0.5,
+                #selectLab = c("FOXN3-AS1","RFTN1","MIR6500","LINC01970","MIR4287","CRABP1","DLG2","SMIM38"),
+                #xlim = c(-15,15),
+                maxoverlapsConnectors = 10,
+                caption = "")
+res30.WC.plot <- res30.WC.plot + theme_classic() +
+  theme(axis.title = element_text(size = 16), 
+        axis.text = element_text(size = 16),  
+        axis.line.x = element_line(color = "black"),  
+        legend.position = "none",
+        plot.title = element_text(size = 16, hjust = 0.5))
+res30.WC.plot
+ggsave("~/Desktop/chronic_analysis/figures/chip_volplot.png",res30.WC.plot, dpi= 300, width = 10)
+```
+
+#stacked barplot with overlapping DE genes for RNA and ChIP
+```{r}
+#DEG barplot
+deg_5 <- sig.genes.rna_5
+deg_5 <- deg_5 %>% mutate(DEG = ifelse(logFC > 0 & padj < 0.05, "Hyper",
+              ifelse(logFC < 0 & padj < 0.05, "Hypo", "non-DAR"))) %>% arrange(pvalue)
+deg_5$DEG <- factor(deg_5$DEG, levels=c("Hyper", "Hypo", "non-DAR"), labels = c("Up","Down", "non-DAR"))
+
+
+deg_30 <- sig.genes.rna_30
+deg_30 <- deg_30 %>% mutate(DEG = ifelse(logFC > 0 & padj < 0.05, "Hyper",
+              ifelse(logFC < 0 & padj < 0.05, "Hypo", "non-DAR"))) %>% arrange(pvalue)
+deg_30$DEG <- factor(deg_30$DEG, levels=c("Hyper", "Hypo", "non-DAR"), labels = c("Up","Down", "non-DAR"))
+
+deg_5$time <- "Day 5"
+deg_30$time <- "Day 30"
+both <- rbind(deg_5,deg_30)
+
+DEG_counts <- deg_30 %>%
+  group_by(time, DEG) %>%
+  summarise(count =n(), .groups ='drop')
+
+DEG_counts$time <- factor(DEG_counts$time, levels = c("Day 5", "Day 30"))
+
+stacked <- ggplot(DEG_counts, aes(x = time, y = count, fill = DEG)) + 
+  geom_bar(stat = "identity", position = "stack") + 
+  labs(x = "", y = "Number of DEGs", fill = "")  + 
+  scale_fill_manual(values = c("Up" = "#EEBCB1FF", "Down" = "#94C5CCFF")) + 
+  theme_classic() + 
+  theme(legend.text=element_text(size=20), text = element_text(size = 20))
+stacked
+#ggsave("~/Desktop/chronic_analysis/figures/rna_stacked.png", stacked, dpi= 300,width = 5, height = 5)
+
+
+
+
+## E: no of DARs with DEG overlap ## 
+DAR_5_chip_genes <- sig.genes.chip_5[,c("SYMBOL", "DAR")]
+DAR_5_chip_genes$assay <- "ChIP-seq"
+DAR_5_chip_genes$day <- "Day 5"
+DAR_30_chip_genes <- sig.genes.chip_30[,c("SYMBOL", "DAR")]
+DAR_30_chip_genes$assay <- "ChIP-seq"
+DAR_30_chip_genes$day <- "Day 30"
+
+DEG_5_rna_genes <- deg_5[,c("external_gene_name","DEG")]
+DEG_5_rna_genes$assay <- "RNA-seq"
+DEG_5_rna_genes$day <- "Day 5"
+DEG_30_rna_genes <- deg_30[,c("external_gene_name","DEG")]
+DEG_30_rna_genes$assay <- "RNA-seq"
+DEG_30_rna_genes$day <- "Day 30"
+
+chip_genes <- rbind(DAR_5_chip_genes, DAR_30_chip_genes)
+names(chip_genes) <- c("gene", "direction", "assay","day")
+rna_genes <- rbind(DEG_5_rna_genes, DEG_30_rna_genes)
+names(rna_genes) <- c("gene", "direction", "assay","day")
+
+
+rna_chip_genes <- rbind(chip_genes, rna_genes)
+rna_chip_genes$direction <- gsub("Hyper", "Up", rna_chip_genes$direction)
+rna_chip_genes$direction <- gsub("Hypo", "Down", rna_chip_genes$direction)
+
+gene_counts <- rna_chip_genes %>%
+  filter(gene != "") %>%
+  group_by(day, assay) %>%
+  summarize(count = n())
+
+# Count the number of overlapping genes
+overlap_counts <- rna_chip_genes %>%
+  filter(gene != "") %>%
+  group_by(day, gene) %>%
+  summarize(count = n()) %>%
+  filter(count > 1) %>%
+  group_by(day) %>%
+  summarize(overlap_count = n())
+
+gene_counts <- left_join(gene_counts, overlap_counts, by = "day")
+gene_counts$day <- factor(gene_counts$day, levels = c("Day 5", "Day 30"))
+
+ggplot(gene_counts[gene_counts$assay == "ChIP-seq", ], aes(x = day, y = count, fill = assay)) + geom_bar(stat = "identity", position = "dodge") + geom_bar(aes(y = overlap_count, fill = "Overlap"), stat = "identity", position = "dodge") + geom_text(aes(label = paste(overlap_count, "/" ,count)), position = position_dodge(width = 0.9), vjust = -0.5, size=4.5) + labs(x = "", y = "Number of DARs", fill = "assay")  + scale_fill_manual(values = ghibli_palette("LaputaMedium", direction = -1), labels = c('ChIP-seq', 'Overlap with RNA-seq'), name = "") + theme_classic() + theme(legend.text=element_text(size=20), text = element_text(size = 20)) 
+#ggsave("~/Desktop/chronic_analysis/figures/rna_chip_overlap.png", dpi= 300, width = 7, height = 5)
+```
+#LRT RNA
+```{r}
+ddsTxi_rna = DESeqDataSetFromTximport(txi, colData = rna_ss, design = ~ exposure + time + exposure:time)
+ddsTxi_rna$exposure <- relevel(ddsTxi_rna$exposure, ref="Vehicle") 
+
+#prefiltering - remove rows with <10 counts for the minimal group size, in this case 5
+smallestGroupSize <- 7
+keep <- rowSums(counts(ddsTxi_rna) >= 10) >= smallestGroupSize
+ddsTxi_rna <- ddsTxi_rna[keep,]
+
+ddsTC_rna <- DESeq(ddsTxi_rna, test="LRT", reduced = ~ time)
+
+resultsNames(ddsTC_rna)
+
+rna_res_LRT <- results(ddsTC_rna)
+rna_res_LRT.df <- as.data.frame(rna_res_LRT)
+counts_ddsTC <- counts(ddsTC_rna)
+resultsNames(ddsTC_rna)
+
+Rot_Veh_rna <- results(ddsTC_rna, name = "exposure_Rotenone_vs_Vehicle", alpha = 0.05)
+Rot_Veh_rna <-as.data.frame(Rot_Veh_rna)
+
+Rot_day5_rna <- results(ddsTC_rna, name = "exposureRotenone.timeDay_5", alpha = 0.05)
+Rot_day5_rna <- as.data.frame(Rot_day5_rna)
+Rot_day5_rna$padj <- p.adjust(Rot_day5_rna$pvalue, method="fdr")
+#Rot_day5_rna <- na.omit(Rot_day5_rna.df)
+
+Rot_day30_rna <- results(ddsTC_rna, name = "exposureRotenone.timeDay_30", alpha = 0.05)
+Rot_day30_rna <- as.data.frame(Rot_day30_rna)
+Rot_day30_rna$padj <- p.adjust(Rot_day30_rna$pvalue, method="fdr")
+#Rot_day30_rna.df <- na.omit(Rot_day30_rna.df)
+
+library(biomaRt)
+
+ensembl_ids <- row.names(Rot_day30_rna)
+#ensembl_ids <- Rot_day30_rna$Row.names
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Get gene symbols using the Ensembl IDs
+genes_info <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name'),
+                    filters = 'ensembl_gene_id',
+                    values = ensembl_ids,
+                    mart = ensembl)
+
+# Update gene_info with multiple conditions
+genes_info <- genes_info %>%
+  mutate(external_gene_name = case_when(
+    ensembl_gene_id == "ENSG00000264545" ~ "CDKN2B-AS1",
+    ensembl_gene_id == "ENSG00000273637" ~ "LNCRNA-GJA9-1",
+    ensembl_gene_id == "ENSG00000272482" ~ "LNCRNA-DHRS3-1",
+    ensembl_gene_id == "ENSG00000182021" ~ "MTHFD1L",
+    ensembl_gene_id == "ENSG00000258082" ~ "LNCRNA-TOMM20-1",
+    ensembl_gene_id == "ENSG00000184906" ~ "MTHFD1L",
+    ensembl_gene_id == "ENSG00000262660" ~ "SLC25A10",
+    ensembl_gene_id == "ENSG00000204422" ~ "Lnc-LY6G6E-1",
+    TRUE ~ external_gene_name # Keeps existing names if none of the above conditions are met
+  ))
+
+Rot_day5_rna <- merge(Rot_day5_rna, genes_info, by.x = "row.names", by.y = "ensembl_gene_id")
+Rot_day30_rna <- merge(Rot_day30_rna, genes_info, by.x = "row.names", by.y = "ensembl_gene_id")
+
+sig.genes.rna <- Rot_Veh_rna %>%
+  filter((log2FoldChange > 0 | log2FoldChange < 0) & padj < 0.05)
+
+sig.genes.rna_5 <- Rot_day5_rna %>%
+  filter((log2FoldChange > 0 | log2FoldChange < 0) & padj < 0.05)
+
+sig.genes.rna_30 <- Rot_day30_rna %>%
+  filter((log2FoldChange > 0 | log2FoldChange < 0) & padj < 0.05)
+
+sum(sig.genes.rna$log2FoldChange < 0) #hypo
+sum(sig.genes.rna$log2FoldChange > 0) #hyper
+sum(sig.genes.rna_5$log2FoldChange < 0)
+sum(sig.genes.rna_5$log2FoldChange > 0)
+sum(sig.genes.rna_30$log2FoldChange < 0)
+sum(sig.genes.rna_30$log2FoldChange > 0)
+```
+#LRT ChIP
+```{r}
+chip_ss$day <- as.factor(chip_ss$day)
+chip_dds <- DESeqDataSetFromMatrix(chip_counts, colData = chip_ss, ~ exposure + day + exposure:day )
+chip_dds$exposure <- relevel(chip_dds$exposure, ref = "vehicle")
+
+#prefiltering - remove rows with <10 counts for the minimal group size, in this case 5
+smallestGroupSize <- 5
+keep <- rowSums(counts(chip_dds) >= 10) >= smallestGroupSize
+chip_dds <- chip_dds[keep,]
+
+ddsTC_chip <- DESeq(chip_dds, test = "LRT", reduced = ~ day)
+
+res_LRT_chip <- results(ddsTC_chip)
+res_LRT_chip.df <- as.data.frame(res_LRT_chip)
+resultsNames(ddsTC_chip)
+
+Rot_Veh_chip <- results(ddsTC_chip, name = "exposure_rotenone_vs_vehicle", alpha = 0.05)
+Rot_Veh_chip <-as.data.frame(Rot_Veh_chip)
+
+Rot_day5_chip <- results(ddsTC_chip, name = "exposurerotenone.day5", alpha = 0.05)
+Rot_day5_chip <- as.data.frame(Rot_day5_chip)
+Rot_day5_chip$padj <- p.adjust(Rot_day5_chip$pvalue, method="fdr")
+Rot_day5_chip <- na.omit(Rot_day5_chip)
+
+Rot_day30_chip <- results(ddsTC_chip, name = "exposurerotenone.day30", alpha = 0.05)
+Rot_day30_chip <- as.data.frame(Rot_day30_chip)
+Rot_day30_chip$padj <- p.adjust(Rot_day30_chip$pvalue, method="fdr")
+Rot_day30_chip <- na.omit(Rot_day30_chip)
+
+counts_rownames <- rownames(chip_counts)
+chip_peaks <- chip_peaks[chip_peaks$Peak %in% counts_rownames, ]
+
+
+chip_annot <- as.data.frame(annotatePeak(makeGRangesFromDataFrame(chip_peaks[,1:3]), 
+                                            TxDb = TxDb.Hsapiens.UCSC.hg38.knownGene,
+                                            tssRegion=c(-3000, 3000), annoDb="org.Hs.eg.db"))
+chip_annot$ID <- paste(chip_annot$start, sep=".", chip_annot$end)
+chip_peaks$ID <- paste(chip_peaks$Start, sep=".", chip_peaks$End)
+m <- chip_peaks$ID %in% chip_annot$ID
+chip_peaks <- chip_peaks[m,]
+
+row.names(chip_annot) <- chip_peaks$Peak
+
+# summary table: add DAR category and sort by p value
+Rot_Veh_chip <- merge(Rot_Veh_chip, chip_annot[,c(1:3,14,16,17)], by = "row.names")
+Rot_Veh_chip <- Rot_Veh_chip %>% mutate(DAR = ifelse(log2FoldChange > 0 & padj < 0.05, "Hyper",
+              ifelse(log2FoldChange < 0 & padj < 0.05, "Hypo", "non-DAR"))) %>% arrange(pvalue)
+Rot_Veh_chip$DAR <- factor(Rot_Veh_chip$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+
+Rot_day5_chip <- merge(Rot_day5_chip, chip_annot[,c(1:3,14,16,17)], by = "row.names")
+Rot_day5_chip <- Rot_day5_chip %>% mutate(DAR = ifelse(log2FoldChange > 0 & padj < 0.05, "Hyper",
+              ifelse(log2FoldChange < 0 & padj < 0.05, "Hypo", "non-DAR"))) %>% arrange(pvalue)
+Rot_day5_chip$DAR <- factor(Rot_day5_chip$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+
+Rot_day30_chip <- merge(Rot_day30_chip, chip_annot[,c(1:3,14,16,17)], by = "row.names")
+Rot_day30_chip <- Rot_day30_chip %>% mutate(DAR = ifelse(log2FoldChange > 0 & padj < 0.05, "Hyper",
+              ifelse(log2FoldChange < 0 & padj < 0.05, "Hypo", "non-DAR"))) %>% arrange(pvalue)
+Rot_day30_chip$DAR <- factor(Rot_day30_chip$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+
+sig.genes.chip_5 <- Rot_day5_chip %>%
+  filter((log2FoldChange > 0 | log2FoldChange < 0) & padj < 0.05)
+
+sig.genes.chip_30 <- Rot_day30_chip %>%
+  filter((log2FoldChange > 0 | log2FoldChange < 0) & padj < 0.05)
+
+sig.genes.chip <- Rot_Veh_chip %>%
+  filter((log2FoldChange > 0 | log2FoldChange < 0) & padj < 0.05)
+
+sum(sig.genes.chip$DAR == "Hyper")
+sum(sig.genes.chip$DAR == "Hypo")
+sum(sig.genes.chip_5$DAR == "Hyper")
+sum(sig.genes.chip_5$DAR == "Hypo")
+sum(sig.genes.chip_30$DAR == "Hyper")
+sum(sig.genes.chip_30$DAR == "Hypo")
+```
+
+#make clusters
+```{r}
+# Subset the LRT results to return genes with padj < 0.05
+sig_res_LRT <- rna_res_LRT %>%
+               data.frame() %>%
+               rownames_to_column(var="gene") %>% 
+               as_tibble() %>% 
+               filter(padj < 0.1)
+
+# Get sig gene lists
+sigLRT_genes <- sig_res_LRT %>% 
+                pull(gene)
+
+clustering_sig_genes <- sig_res_LRT %>%
+                  arrange(padj)
+
+rownames(rna_ss) <- rna_ss$sample_name
+rld <- vst(ddsTC_rna, blind=TRUE)
+rld_mat <- assay(rld)
+cluster_rlog <- rld_mat[clustering_sig_genes$gene, ]
+rna_ss$time <- as.factor(rna_ss$time)
+rna_ss$time <- factor(rna_ss$time, levels = c("Day_1", "Day_5", "Day_30"))
+rna_ss$exposure <- as.factor(rna_ss$exposure)
+
+clusters <- degPatterns(cluster_rlog, metadata = rna_ss, time = "time", col= "exposure", minc = 15)
+degPlotCluster(clusters$normalized, "time", "exposure", lines = FALSE)
+```
+#g2 cholesterol
+```{r}
+cluster_groups <- clusters$df
+group2 <- clusters$df %>%
+          filter(cluster == 2)
+
+vsd <- vst(ddsTxi_rna, blind=TRUE)
+mat <- assay(vsd)
+group2_vsd <- merge(group2, mat, by.x = "row.names", by.y = "row.names")
+
+group2 <- merge(group2, genes_info, by.x = "row.names", by.y = "ensembl_gene_id")
+group2 <- merge(group2, rna_res_LRT.df, by.x = "Row.names", by.y = "row.names")
+group2 <- arrange(group2,pvalue)
+group2_genes_top10 <- group2 %>% 
+  slice_head(n = 10)
+group2_genes <- group2$external_gene_name
+
+group2_list <- list(Hyper=group2[group2$cluster=="2",]$external_gene_name)
+
+group2_GO <- list() 
+for (x in c("Hyper")){
+  print(x)
+  
+  print("GO_Molecular_Function")
+  GO <- enrichGO(group2_list$Hyper,
+                    OrgDb = org.Hs.eg.db, keyType = "SYMBOL", 
+                    ont = "MF", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    group2_GO[[x]]$GO_Molecular_Function <- as.data.frame(GO@result)
+    group2_GO[[x]]$GO_Molecular_Function$direction <- x
+    group2_GO[[x]]$GO_Molecular_Function$category <- "Molecular function"
+  }
+  
+  print("GO_Biological_Process")
+  GO <- enrichGO(group2_list$Hyper,
+                    OrgDb = org.Hs.eg.db, keyType = "SYMBOL", 
+                    ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    group2_GO[[x]]$GO_Biological_Process <- as.data.frame(GO@result)
+    group2_GO[[x]]$GO_Biological_Process$direction <- x
+    group2_GO[[x]]$GO_Biological_Process$category <- "Biological process"
+  }
+}
+
+# GO summary tables: all / top 10
+group2_GO_all <- do.call(rbind, lapply(unlist(group2_GO, recursive = FALSE), as.data.frame))
+group2_GO_top <- group2_GO_all %>% arrange(p.adjust) %>% group_by(direction) %>% slice_head(n=10)
+group2_GO_top$GeneRatioNumeric <- sapply(group2_GO_top$GeneRatio, function(x) eval(parse(text = x)))
+
+```
+#plot g2 cholesterol
+```{r}
+group2_genes <- group2$Row.names
+group2cluster <- subset(clusters$normalized, clusters$normalized$genes %in% group2_genes)
+
+# Plot the cluster using degPlotCluster
+degPlotCluster(group2cluster, "time", "exposure", lines = FALSE)
+
+#GO enrichment plot
+group2_GO_plot <- ggplot(group2_GO_top[group2_GO_top$direction == "Hyper", ],
+       aes(x = GeneRatioNumeric, y = reorder(Description, -log10(p.adjust)))) +
+  geom_point(aes(size = -log10(p.adjust), color = -log10(p.adjust)), alpha = 0.7) + 
+  scale_color_gradient(low = "#D8AF39FF", high = "#DE7862FF") + 
+  scale_size(range = c(1, 10)) + 
+  theme_minimal() + 
+  theme(axis.text.y = element_text(size = 16),
+        axis.title.x = element_text(size = 12),
+        plot.title = element_text(size = 16, hjust = 1, face = "bold"),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 12)) +
+  xlab("Gene Ratio") + ylab("") +
+  guides(size = guide_legend(title = "-log10(FDR)"), color = guide_legend(title = "-log10(FDR)")) +
+  scale_y_discrete(labels = label_wrap_gen(55)) # Adjust wrapping as needed
+group2_GO_plot
+ggsave("./figures/g2_cholesterol_GO.png", group2_GO_plot, dpi= 300, width = 10)
+```
+
+#g4 synapse
+```{r}
+group4 <- clusters$df %>%
+          filter(cluster == 4)
+
+group4_vsd <- merge(group4, mat, by.x = "row.names", by.y = "row.names")
+
+group4 <- merge(group4, genes_info, by.x = "genes", by.y = "ensembl_gene_id")
+group4 <- merge(group4, rna_res_LRT.df, by.x = "genes", by.y = "row.names")
+group4 <- arrange(group4,pvalue)
+group4_4genes_top10 <- group4 %>% 
+  slice_head(n = 10)
+group4_4genes <- group4$external_gene_name
+
+group4_list <- list(Hyper=group4[group4$cluster=="4",]$external_gene_name)
+
+group4_GO <- list() 
+for (x in c("Hyper")){
+  print(x)
+  
+  print("GO_Molecular_Function")
+  GO <- enrichGO(group4_list$Hyper,
+                    OrgDb = org.Hs.eg.db, keyType = "SYMBOL", 
+                    ont = "MF", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    group4_GO[[x]]$GO_Molecular_Function <- as.data.frame(GO@result)
+    group4_GO[[x]]$GO_Molecular_Function$direction <- x
+    group4_GO[[x]]$GO_Molecular_Function$category <- "Molecular function"
+  }
+  
+  print("GO_Biological_Process")
+  GO <- enrichGO(group4_list$Hyper,
+                    OrgDb = org.Hs.eg.db, keyType = "SYMBOL", 
+                    ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    group4_GO[[x]]$GO_Biological_Process <- as.data.frame(GO@result)
+    group4_GO[[x]]$GO_Biological_Process$direction <- x
+    group4_GO[[x]]$GO_Biological_Process$category <- "Biological process"
+  }
+}
+
+# GO summary tables: all / top 10
+group4_GO_all <- do.call(rbind, lapply(unlist(group4_GO, recursive = FALSE), as.data.frame))
+group4_GO_top <- group4_GO_all %>% arrange(p.adjust) %>% group_by(direction) %>% slice_head(n=10)
+group4_GO_top$GeneRatioNumeric <- sapply(group4_GO_top$GeneRatio, function(x) eval(parse(text = x)))
+```
+#plot g4 synapse
+```{r}
+group4_genes <- group4$genes
+group4cluster <- subset(clusters$normalized, clusters$normalized$genes %in% group4_genes)
+
+# Plot the cluster using degPlotCluster
+degPlotCluster(group4cluster, "time", "exposure", lines = FALSE)
+
+#GO enrichment plot
+group4_GO_plot <- ggplot(group4_GO_top[group4_GO_top$direction == "Hyper", ],
+       aes(x = GeneRatioNumeric, y = reorder(Description, -log10(p.adjust)))) +
+  geom_point(aes(size = -log10(p.adjust), color = -log10(p.adjust)), alpha = 0.7) + 
+  scale_color_gradient(low = "#D8AF39FF", high = "#DE7862FF") + 
+  scale_size(range = c(1, 10)) + 
+  theme_minimal() + 
+  theme(axis.text.y = element_text(size = 16),
+        axis.title.x = element_text(size = 12),
+        plot.title = element_text(size = 16, hjust = 1, face = "bold"),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 12)) +
+  xlab("Gene Ratio") + ylab("") +
+  guides(size = guide_legend(title = "-log10(FDR)"), color = guide_legend(title = "-log10(FDR)")) +
+  scale_y_discrete(labels = label_wrap_gen(55)) # Adjust wrapping as needed
+group4_GO_plot
+ggsave("./figures/g4_synapse_GO.png", group4_GO_plot, dpi= 300, width = 10)
+```
+                                         #heatmap mevalonate
+```{r}
+betas_r <- coef(ddsTC_rna)
+colnames(betas_r)
+
+#mevalonate pathway genes
+mevalonate <- c("SREBF2","SREBF1","ACAT1","HMGCS1","HMGCS2","HMGCR","MVK","MVD","PMVK","IDI2","FDPS","GGPS1","SQLE","CYP51A1","DHCR7","LDLR")
+# Get gene symbols using the Ensembl IDs
+genes_info <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name'),
+                    filters = 'external_gene_name',
+                    values = mevalonate,
+                    mart = ensembl)
+mevalonate.ens <- genes_info$ensembl_gene_id
+indices_mevalonate <- which(row.names(rna_res_LRT) %in% mevalonate.ens)
+mat_r <- betas_r[indices_mevalonate, -c(1:4)]
+
+ensembl_ids <- rownames(mat_r)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+# Get gene symbols using the Ensembl IDs
+genes_info <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name'),
+                    filters = 'ensembl_gene_id',
+                    values = ensembl_ids,
+                    mart = ensembl)
+
+# Rename the row names using HGNC symbols
+row.names(mat_r) <- genes_info$external_gene_name
+colnames(mat_r) <- c("RNA_30","RNA_5")
+
+betas_c <- coef(ddsTC_chip)
+colnames(betas_c)
+
+x <- Rot_Veh_chip[Rot_Veh_chip$SYMBOL %in% mevalonate,]
+x <- x[order(x$pvalue),]
+x <- x[!duplicated(x$SYMBOL), ]
+y <- x$Row.names
+z <- x$SYMBOL
+
+indices <- which(row.names(res_LRT_chip) %in% y)
+mat_c <- betas_c[indices, -c(1:4)]
+
+row.names(mat_c) <- z
+colnames(mat_c) <- c("ChIP_5", "ChIP_30")
+
+mat_both <- merge(mat_r, mat_c, by = "row.names")
+row.names(mat_both) <- mat_both$Row.names
+
+new_order <- c(3,4,2,5)
+
+# Reorder columns
+mat_both <- mat_both[, new_order]
+
+new_order <- c(14,13,1,7,6,10,9,11,4,5,12,2,3,8)
+mat_both <- mat_both[new_order,]
+# Create the data frame
+Assay <- c("RNA_5", "ChIP_5", "RNA_30","ChIP_30")
+ann_col <- data.frame(Assay)
+row.names(ann_col) <- colnames(mat_both)
+
+colors <- c(RNA_5 = "#67B8D6FF",ChIP_5="#E9D097FF", RNA_30 ="#1C77A3FF",ChIP_30 ="#C5A387FF")
+
+ann_colors <- list(Assay = setNames(colors, Assay))
+
+colour_palette <- paletteer_c("ggthemes::Red-Blue Diverging", 100)
+colour_palette <- rev(colour_palette)
+breaks <- seq(-2.2, 2.2, length.out = 101)
+deg_heatmap <- pheatmap(
+  mat_both,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Mevalonate pathway logFC",
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+  fontsize_row = 8,
+  angle_row = 45, 
+  cellwidth = 10,
+  cellheight = 10,
+  legend = TRUE,       # Add a legend for the color scale
+  legend_scale = 1,    # Adjust the size of the 
+  treeheight_row = 0,
+  color = colour_palette,
+  treeheight_col = 0,
+  legend_position = "right",
+  border_color = NA,
+  breaks = breaks
+)
+
+ggsave("./path/to/files/figures/mevalonate_heatmap.png", deg_heatmap, dpi=300)
+```
+#srepbf2 counts
+```{r}
+SREBF2 <- plotCounts(ddsTC_rna, gene="ENSG00000198911", intgroup="group", returnData = TRUE)
+
+SREBF2 <- SREBF2[!row.names(SREBF2) %in% c("RNA_DAY30_Vehicle_8"), ]
+
+SREBF2$group <- gsub("_", " ", SREBF2$group)
+
+SREBF2$group <- factor(SREBF2$group, levels = c("Vehicle Day 1", "Rotenone Day 1","Vehicle Day 5", "Rotenone Day 5","Vehicle Day 30", "Rotenone Day 30"))
+
+my_comparisons <- list( c("Vehicle Day 1", "Rotenone Day 1"),
+                        c("Vehicle Day 5", "Rotenone Day 5"),
+                        c("Vehicle Day 30", "Rotenone Day 30"),
+                        c("Vehicle Day 5", "Vehicle Day 30"),
+                        c("Rotenone Day 5", "Rotenone Day 30"))
+
+custom_colors <- c("Vehicle Day 1" = "#5E2D30FF", "Rotenone Day 1"= "#C5A387FF","Vehicle Day 5"= "#1C77A3FF","Rotenone Day 5" = "#67B8D6FF","Vehicle Day 30" = "#008E90FF", "Rotenone Day 30" = "#E9D097FF")
+
+library(ggpubr) 
+SREPF2_plot <- ggplot(SREBF2, aes(x=group, y=count, fill=group)) + 
+  geom_boxplot() + 
+  theme_classic() + 
+  scale_fill_manual(values = custom_colors, name = "Condition") + 
+  ylab("Counts") + 
+  ggtitle("SREBF2") + 
+  xlab("") + 
+  theme(text = element_text(size = 20), plot.title = element_text(hjust = 0.5, face=c("italic"))) + 
+  stat_compare_means(comparisons = my_comparisons, method="t.test", size=4) + 
+  geom_jitter() + 
+  labs(fill=NULL)
+
+# Wrap x-axis labels
+SREPF2_plot <- SREPF2_plot + scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+
+SREPF2_plot
+ggsave("./path/to/files/figures/SREBF2_counts.png", SREPF2_plot, dpi=300, width = 10)
+```
+#heatmap chemokines
+```{r}
+chemokines <- c("CCL2","CCL5","CXCL8","IL1A","IL1B","IL6","IL12A")
+
+betas_r <- coef(ddsTC_rna)
+colnames(betas_r)
+
+#mevalonate pathway genes
+
+# Get gene symbols using the Ensembl IDs
+genes_info <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name'),
+                    filters = 'external_gene_name',
+                    values = chemokines,
+                    mart = ensembl)
+chemokines.ens <- genes_info$ensembl_gene_id
+indices_chemokines <- which(row.names(rna_res_LRT) %in% chemokines.ens)
+mat_r <- betas_r[indices_chemokines, -c(1:4)]
+
+ensembl_ids <- rownames(mat_r)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+# Get gene symbols using the Ensembl IDs
+genes_info <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name'),
+                    filters = 'ensembl_gene_id',
+                    values = ensembl_ids,
+                    mart = ensembl)
+
+# Rename the row names using HGNC symbols
+row.names(mat_r) <- genes_info$external_gene_name
+colnames(mat_r) <- c("RNA_30","RNA_5")
+
+new_order <- c(2,1)
+
+# Reorder columns
+mat_r <- mat_r[, new_order]
+
+"CCL2"  "IL1A"  "IL1B"  "IL6"   "IL12A" "CXCL8" "CCL5" 
+new_order <- c(1,7,6,2:5)
+mat_r <- mat_r[new_order,]
+
+# Create the data frame
+Assay <- c("RNA_5","RNA_30")
+ann_col <- data.frame(Assay)
+row.names(ann_col) <- colnames(mat_r)
+
+colors <- c(RNA_5 = "#67B8D6FF",RNA_30 ="#1C77A3FF")
+
+ann_colors <- list(Assay = setNames(colors, Assay))
+
+colour_palette <- paletteer_c("ggthemes::Red-Blue Diverging", 100)
+colour_palette <- rev(colour_palette)
+breaks <- seq(-2.3, 2.3, length.out = 101)
+deg_heatmap <- pheatmap(
+  mat_r,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Chemokines logFC",
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  annotation_col = ann_col,
+  annotation_colors = ann_colors,
+  fontsize_row = 8,
+  angle_row = 45, 
+  cellwidth = 10,
+  cellheight = 10,
+  legend = TRUE,       
+  legend_scale = 1,    
+  treeheight_row = 0,
+  color = colour_palette,
+  treeheight_col = 0,
+  legend_position = "right",
+  border_color = NA,
+  breaks = breaks
+)
+ggsave("./path/to/files/figures/chemokines_heatmap.png", deg_heatmap, dpi=300)
+```
+#motif analysis
+```{r}
+# create a BED file for hyper-acetylated regions
+D30_DAR_hyper <- Rot_day30_chip[Rot_day30_chip$log2FoldChange > 0,]
+D30_DAR_hyper <- D30_DAR_hyper[order(D30_DAR_hyper$pvalue),]
+D30_DAR_hyper <- D30_DAR_hyper[1:200,8:10]
+D30_DAR_hyper$ID <- paste0("ID",row.names(D30_DAR_hyper))
+D30_DAR_hyper$value <- "0"
+D30_DAR_hyper$direction <- "+"
+write.table(D30_DAR_hyper,"~/Desktop/chronic_analysis/D30_hyper_redo.bed", row.names = FALSE, col.names = FALSE, sep = "\t", quote = FALSE)
+
+# create a BED file for hypo-acetylated regions
+D30_DAR_hypo <- Rot_day30_chip[Rot_day30_chip$log2FoldChange < 0,]
+D30_DAR_hypo <- D30_DAR_hypo[order(D30_DAR_hypo$pvalue),]
+D30_DAR_hypo <- D30_DAR_hypo[1:200,8:10]
+D30_DAR_hypo$ID <- paste0("ID",row.names(D30_DAR_hypo))
+D30_DAR_hypo$value <- "0"
+D30_DAR_hypo$direction <- "+"
+write.table(D30_DAR_hypo,"~/Desktop/chronic_analysis/D30_hypo_redo.bed", row.names = FALSE, col.names = FALSE, sep = "\t", quote = FALSE)
+
+# create a BED file for all peaks to be used as the background in HOMER
+D30_peaks_all <- chip_peaks
+D30_peaks_all$value <- "0"
+D30_peaks_all$direction <- "+"
+write.table(D30_peaks_all, "~/Desktop/chronic_analysis/D30_peaks_all_redo.bed", row.names = FALSE, col.names = FALSE, sep = "\t", quote = FALSE)
+
+# import result
+D30_motif_hypo <- read.delim("knownResults_redo.txt", check.names = FALSE)
+
+# annotate each motif to known transcription factors (TFs)
+D30_motif_hypo$TF <- sub("/.*", "", D30_motif_hypo$`Motif Name`)
+
+# rename key columns
+names(D30_motif_hypo)[c(4,6)] = c("logP", "motif_number")
+D30_motif_hypo$logP <- -D30_motif_hypo$logP
+D30_motif_hypo$fdr <- p.adjust(D30_motif_hypo$`P-value`, method = "fdr")
+D30_motif_hypo$log10fdr <- -log10(D30_motif_hypo$fdr)
+
+# highlight significant motifs
+D30_motif_hypo <- D30_motif_hypo %>% mutate(sig = ifelse(log10fdr > -log2(0.05), "Significant", "Non-significant"))
+D30_motif_hypo$TF_name <- sub("\\(.*", "", D30_motif_hypo$TF)
+
+D30_motif_hypo$`% of Target Sequences with Motif` <- gsub("%", "", D30_motif_hypo$`% of Target Sequences with Motif`)
+D30_motif_hypo$`% of Background Sequences with Motif` <- gsub("%", "", D30_motif_hypo$`% of Background Sequences with Motif`)
+
+# delete rows where percentage in background is 0 
+D30_motif_hypo <- D30_motif_hypo [as.numeric(D30_motif_hypo$`% of Background Sequences with Motif`) != 0.00, ]
+
+# calculate log2enr 
+D30_motif_hypo$logFC <- log2(as.numeric(D30_motif_hypo$`% of Target Sequences with Motif`) / as.numeric(D30_motif_hypo$`% of Background Sequences with Motif`))
+```
+                                              #NRXN2 counts
+```{r}
+NRXN2 <- plotCounts(ddsTC_rna, gene="ENSG00000110076", intgroup="group", returnData = TRUE)
+
+#NRXN2 <- NRXN2[!row.names(NRXN2) %in% c("RNA_DAY30_Vehicle_8"), ]
+
+NRXN2$group <- gsub("_", " ", NRXN2$group)
+
+NRXN2$group <- factor(NRXN2$group, levels = c("Vehicle Day 1", "Rotenone Day 1","Vehicle Day 5", "Rotenone Day 5","Vehicle Day 30", "Rotenone Day 30"))
+
+my_comparisons <- list( c("Vehicle Day 1", "Rotenone Day 1"),
+                        c("Vehicle Day 5", "Rotenone Day 5"),
+                        c("Vehicle Day 30", "Rotenone Day 30"),
+                        c("Vehicle Day 5", "Vehicle Day 30"),
+                        c("Rotenone Day 5", "Rotenone Day 30"))
+
+custom_colors <- c("Vehicle Day 1" = "#5E2D30FF", "Rotenone Day 1"= "#C5A387FF","Vehicle Day 5"= "#1C77A3FF","Rotenone Day 5" = "#67B8D6FF","Vehicle Day 30" = "#008E90FF", "Rotenone Day 30" = "#E9D097FF")
+
+library(ggpubr) 
+NRXN2_plot <- ggplot(NRXN2, aes(x=group, y=count, fill=group)) + 
+  geom_boxplot() + 
+  theme_classic() + 
+  scale_fill_manual(values = custom_colors, name = "Condition") + 
+  ylab("Counts") + 
+  ggtitle("NRXN2") + 
+  xlab("") + 
+  theme(text = element_text(size = 20), plot.title = element_text(hjust = 0.5, face=c("italic"))) + 
+  stat_compare_means(comparisons = my_comparisons, method="t.test", size=4) + 
+  geom_jitter() + 
+  labs(fill=NULL)
+
+# Wrap x-axis labels
+NRXN2_plot <- NRXN2_plot + scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+
+NRXN2_plot
+ggsave("./path/to/files/figures/NRXN2_counts.png", NRXN2_plot, dpi=300, width = 10)
+```
