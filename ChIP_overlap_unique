@@ -1,0 +1,584 @@
+```{r libraries}
+knitr::opts_chunk$set(echo = FALSE)
+library(edgeR)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(clusterProfiler)
+library(stringi)
+library(readr)
+library(ChIPseeker)
+library(gtools)
+library(patchwork)
+library(png)
+library(org.Rn.eg.db)
+library(ggpubr)
+library(GenomicRanges)
+library(TxDb.Rnorvegicus.UCSC.rn7.refGene)
+library(openxlsx)
+library(gridExtra)
+library(ggseqlogo)
+library(scales)
+library(CHAS)
+library(EnhancedVolcano)
+```
+
+```{r ChIP import data}
+setwd("path/to/file/")
+mapped_reads<-read.csv("path/to/file/bulk_rat_chip_reads.csv", header = T)
+load(file = "PFC_H3K27ac_peaks_counts.rda")
+
+group <- mapped_reads$name
+design <- model.matrix(~group)
+keep <- filterByExpr(counts, design)
+counts <- counts[keep,]
+CTX_peaks <- peaks
+CTX_counts <- counts
+
+rm(counts, peaks)
+
+# import H3K27ac peaks and counts
+load("path/to/file/SN_H3K27ac_peaks_counts.rda")
+group <- mapped_reads$name
+design <- model.matrix(~group)
+keep <- filterByExpr(counts, design)
+counts <- counts[keep,]
+SN_peaks <- peaks
+SN_counts <- counts
+rm(counts, peaks, design, keep, mapped_reads,group)
+```
+
+```{r annotation}
+# gene annotation
+SN_annot <- as.data.frame(annotatePeak(makeGRangesFromDataFrame(SN_peaks[,1:3]), 
+                                            TxDb = TxDb.Rnorvegicus.UCSC.rn7.refGene,
+                                            tssRegion=c(-3000, 3000), annoDb="org.Rn.eg.db"))
+SN_annot$ID<-paste(SN_annot$start, sep=".", SN_annot$end)
+
+CTX_annot <- as.data.frame(annotatePeak(makeGRangesFromDataFrame(CTX_peaks[,1:3]), 
+                                            TxDb = TxDb.Rnorvegicus.UCSC.rn7.refGene,
+                                            tssRegion=c(-3000, 3000), annoDb="org.Rn.eg.db"))
+CTX_annot$ID<-paste(CTX_annot$start, sep=".", CTX_annot$end)
+```
+
+```{r overlap and unique peaks}
+# List of peaks 
+cortex_peaks_list <- list(Cortex = CTX_peaks)
+SN_peaks_list <- list(SN = SN_peaks)
+
+# Annotate midbrain peaks and identify which overlap with cortex peaks, 0.5 specifies that a 50% overlap is required between the midbrain and cortex peak
+SN_CTX_overlap <- CelltypeSpecificPeaks(SN_peaks, cortex_peaks_list, 0.5)
+CTX_SN_overlap <- CelltypeSpecificPeaks(CTX_peaks, SN_peaks_list, 0.5)
+
+# Check which midbrain peaks overlap cortex peaks 
+# This will show you all your midbrain peaks that overlapped at least 50% of the cortex peaks (you can change the percentage to whatever you want in the CelltypeSpecificPeaks function)
+SN_CTX_overlap_50perc <- SN_CTX_overlap[[1]] 
+CTX_SN_overlap_50perc <- CTX_SN_overlap[[1]]
+
+# Now that I have the overlapping peaks, I have to merge the counts with remaining peaks 
+SN_CTX_overlap_counts_peaks <- merge(SN_CTX_overlap_50perc, SN_counts, by.x = "bulkPeak", by.y = "row.names")
+CTX_SN_overlap_counts_peaks <- merge(CTX_SN_overlap_50perc, CTX_counts, by.x = "bulkPeak", by.y = "row.names")
+
+SN_CTX_overlap_counts_peaks$ID <- paste(SN_CTX_overlap_counts_peaks$bulkStart, SN_CTX_overlap_counts_peaks$bulkEnd, sep = ".")
+CTX_SN_overlap_counts_peaks$ID <- paste(CTX_SN_overlap_counts_peaks$celltypeStart, CTX_SN_overlap_counts_peaks$celltypeEnd, sep= ".")
+
+overlap_counts_peaks <- merge(SN_CTX_overlap_counts_peaks, CTX_SN_overlap_counts_peaks, by.x = "ID", by.y = "ID")
+overlap_counts_peaks <- overlap_counts_peaks[!duplicated(overlap_counts_peaks$bulkPeak.x),]
+
+rownames(overlap_counts_peaks) <- overlap_counts_peaks$bulkPeak.x
+
+SNoverlap_counts <- overlap_counts_peaks[, c(10:18)]
+CTXoverlap_counts <- overlap_counts_peaks[, c(27:35)]
+SNoverlap_peaks <- overlap_counts_peaks[,c(4,5,6,2)]
+CTXoverlap_peaks <- overlap_counts_peaks[,c(4,7,8,2)]
+colnames(SNoverlap_peaks) <- c("Chr", "Start", "End", "Peak")
+colnames(CTXoverlap_peaks) <- c("Chr", "Start", "End", "Peak")
+rm(SN_CTX_overlap_counts_peaks,CTX_SN_overlap_counts_peaks,SN_CTX_overlap_50perc,CTX_SN_overlap_50perc,overlap_counts_peaks)
+
+#####UNIQUE######
+
+SNunique <- SN_CTX_overlap[[2]]
+SNunique <- SNunique %>% filter(Annot=="Other")
+SNunique_peaks <- SNunique[,c(1:4)]
+colnames(SNunique_peaks) <- c("Chr", "Start", "End", "Peak")
+
+SNunique_counts_peaks <- merge(SNunique_peaks, SN_counts, by.x = "Peak", by.y = "row.names")
+rownames(SNunique_counts_peaks) <- SNunique_counts_peaks$Peak
+SNunique_counts <- SNunique_counts_peaks[,c(5:13)]
+rm(SNunique_counts_peaks,SNunique)
+
+CTXunique <- CTX_SN_overlap[[2]]
+CTXunique <- CTXunique %>% filter(Annot=="Other")
+CTXunique_peaks <- CTXunique[,c(1:4)]
+colnames(CTXunique_peaks) <- c("Chr", "Start", "End", "Peak")
+
+CTXunique_counts_peaks <- merge(CTXunique_peaks, CTX_counts, by.x = "Peak", by.y = "row.names")
+rownames(CTXunique_counts_peaks) <- CTXunique_counts_peaks$Peak
+CTXunique_counts <- CTXunique_counts_peaks[,c(5:13)]
+rm(CTXunique_counts_peaks,CTXunique)
+```
+
+```{r SN overlap}
+#defining treatment combination
+SNgroup = factor(c(rep("rotenone",5),rep("control",4)))
+SNgroup <- relevel(SNgroup, "control")
+SNdesign <- model.matrix(~SNgroup)
+
+SNpeakList <- DGEList(counts = SNoverlap_counts, group = SNgroup)
+SNpeak_norm <- calcNormFactors(SNpeakList)
+
+SNDGE_norm_disp <- estimateDisp(SNpeak_norm, SNdesign)
+SNfit <- glmQLFit(SNDGE_norm_disp, SNdesign)
+
+SNqlf <- glmQLFTest(SNfit)
+SN_DAR <- SNqlf$table
+rm(SNDGE_norm_disp, SNfit, SNqlf, SNpeak_norm, SNdesign, SNpeakList)
+
+# order peaks by significance
+SN_DAR$FDR <- p.adjust(SN_DAR$PValue, method="fdr")
+SN_DAR <- SN_DAR[order(SN_DAR$PValue),]
+
+# gene annotation
+SNoverlap_peaks$ID <- paste(SNoverlap_peaks$Start, sep=".", SNoverlap_peaks$End)
+m <- SNoverlap_peaks$ID %in% SN_annot$ID
+SNoverlap_peaks <- SNoverlap_peaks[m,]
+
+SNoverlap <- merge(SNoverlap_peaks, SN_annot, by = "ID")
+rownames(SNoverlap) <- SNoverlap$Peak
+
+# summary table: add DAR category and sort by p value
+SNoverlap <- merge(SN_DAR, SNoverlap[,c(2:6,19:22)], by = "row.names")
+row.names(SNoverlap) <- SNoverlap$Row.names
+SNoverlap <- SNoverlap[,c(7:10,2:6,12,14)]
+names(SNoverlap)[c(1,11)] <-  c("chr","GENE")
+SNoverlap <- SNoverlap %>% mutate(DAR = ifelse(logFC > 0 & FDR < 0.05, "Hyper",
+              ifelse(logFC < 0 & FDR < 0.05, "Hypo", "non-DAR"))) %>% arrange(PValue)
+SNoverlap$DAR <- factor(SNoverlap$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+rm(SNoverlap_peaks)
+```
+
+```{r CTX overlap}
+CTXgroup = factor(c(rep("rotenone", 2), rep("control", 3), rep("rotenone", 2),"control","rotenone"))
+CTXgroup <- relevel(CTXgroup, "control")
+CTXdesign <- model.matrix(~CTXgroup)
+
+CTXpeakList <- DGEList(counts = CTXoverlap_counts, group = CTXgroup)
+CTXpeak_norm <- calcNormFactors(CTXpeakList)
+
+CTXDGE_norm_disp <- estimateDisp(CTXpeak_norm, CTXdesign)
+CTXfit <- glmQLFit(CTXDGE_norm_disp, CTXdesign)
+
+CTXqlf <- glmQLFTest(CTXfit)
+CTX_DAR <- CTXqlf$table
+rm(CTXDGE_norm_disp, CTXfit, CTXqlf, CTXpeak_norm, CTXdesign, CTXpeakList)
+
+# order peaks by significance
+CTX_DAR$FDR <- p.adjust(CTX_DAR$PValue, method="fdr")
+CTX_DAR <- CTX_DAR[order(CTX_DAR$PValue),]
+
+# gene annotation
+CTXoverlap_peaks$ID <- paste(CTXoverlap_peaks$Start, sep=".", CTXoverlap_peaks$End)
+m <- CTXoverlap_peaks$ID %in% CTX_annot$ID
+CTXoverlap_peaks <- CTXoverlap_peaks[m,]
+
+CTXoverlap <- merge(CTXoverlap_peaks, CTX_annot, by = "ID")
+rownames(CTXoverlap) <- CTXoverlap$Peak
+
+# summary table: add DAR category and sort by p value
+CTXoverlap <- merge(CTX_DAR, CTXoverlap[,c(2:6,19:22)], by = "row.names")
+row.names(CTXoverlap) <- CTXoverlap$Row.names
+CTXoverlap <- CTXoverlap[,c(7:10,2:6,12,14)]
+names(CTXoverlap)[c(1,11)] <-  c("chr","GENE")
+CTXoverlap <- CTXoverlap %>% mutate(DAR = ifelse(logFC > 0 & FDR < 0.05, "Hyper",
+              ifelse(logFC < 0 & FDR < 0.05, "Hypo", "non-DAR"))) %>% arrange(PValue)
+CTXoverlap$DAR <- factor(CTXoverlap$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+rm(CTXoverlap_peaks)
+```
+
+```{r scatter plot of effect sizes}
+SN_DAR$peak <- rownames(SN_DAR)
+CTX_DAR$peak <- rownames(CTX_DAR)
+merged_df <- merge(SN_DAR,CTX_DAR, by = "peak", suffixes = c("_SN", "_CTX"))
+
+SNsig_down <- merged_df[merged_df$FDR_SN < 0.05 & merged_df$logFC_SN < 0,]
+SNsig_up <- merged_df[merged_df$FDR_SN < 0.05 & merged_df$logFC_SN > 0,]
+
+CTXsig_down <- merged_df[merged_df$FDR_CTX < 0.05 & merged_df$logFC_CTX < 0,]
+CTXsig_up <- merged_df[merged_df$FDR_CTX < 0.05 & merged_df$logFC_CTX > 0,]
+sig_merged <- r
+
+ggplot(merged_df, aes(x = logFC_SN, y = logFC_CTX)) +
+  geom_point(color = "darkblue") +
+  labs(x = "SNpc logFC", y = "Cortex logFC", title = "logFC of shared peaks") +
+  xlim(-3, 3) +
+  ylim(-3, 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal()
+
+ggsave("path/to/file/figures/effect_sizes.png", dpi=300)
+```
+
+```{r direction of effect}
+CTX_significant <- CTXoverlap[CTXoverlap$FDR < 0.05,]
+SN_significant <- SNoverlap[SNoverlap$FDR < 0.05,]
+merged_df <- merge(CTX_significant, SN_significant, by = "GENE", suffixes = c("_CTX", "_SN"))
+
+# Check direction of effect
+merged_df <- merged_df %>%
+  mutate(same_direction = sign(logFC_CTX) == sign(logFC_SN))
+
+# Summary of results
+summary_df <- merged_df %>%
+  summarise(
+    total_genes = n(),
+    same_direction_count = sum(same_direction),
+    different_direction_count = sum(!same_direction),
+    proportion_same_direction = mean(same_direction)
+  )
+
+# Print summary
+print(summary_df)
+```
+
+```{r GO overlap peaks}
+# gene annotation
+# summary table: add DAR category and sort by p value
+CTXoverlap <- CTXoverlap %>%
+  mutate(DAR = case_when(
+    logFC > 0 & FDR < 0.05 ~ "Hyper",
+    logFC < 0 & FDR < 0.05 ~ "Hypo",
+    TRUE ~ "non-DAR"
+  )) %>%
+  arrange(PValue)
+CTXoverlap$DAR <- factor(CTXoverlap$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+
+SNoverlap <- SNoverlap %>%
+  mutate(DAR = case_when(
+    logFC > 0 & FDR < 0.05 ~ "Hyper",
+    logFC < 0 & FDR < 0.05 ~ "Hypo",
+    TRUE ~ "non-DAR"
+  )) %>%
+  arrange(PValue)
+SNoverlap$DAR <- factor(SNoverlap$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+
+# create DAR gene list
+SN_overlap_DAR_list <- list(Hyper=SNoverlap[SNoverlap$DAR=="Hyper",]$GENE, 
+                 Hypo=SNoverlap[SNoverlap$DAR=="Hypo",]$GENE)
+
+SN_overlap_GO_DAR <- list() 
+for (x in c("Hyper", "Hypo")){
+  print(x)
+  
+  print("GO_Molecular_Function")
+  GO <- enrichGO(SN_overlap_DAR_list[[x]],
+                    OrgDb = org.Rn.eg.db, keyType = "SYMBOL", 
+                    ont = "MF", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    SN_overlap_GO_DAR[[x]]$GO_Molecular_Function <- as.data.frame(GO@result)
+    SN_overlap_GO_DAR[[x]]$GO_Molecular_Function$direction <- x
+    SN_overlap_GO_DAR[[x]]$GO_Molecular_Function$category <- "Molecular function"
+  }
+  
+  print("GO_Biological_Process")
+  GO <- enrichGO(SN_overlap_DAR_list[[x]],
+                    OrgDb = org.Rn.eg.db, keyType = "SYMBOL", 
+                    ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    SN_overlap_GO_DAR[[x]]$GO_Biological_Process <- as.data.frame(GO@result)
+    SN_overlap_GO_DAR[[x]]$GO_Biological_Process$direction <- x
+    SN_overlap_GO_DAR[[x]]$GO_Biological_Process$category <- "Biological process"
+  }
+}
+
+# GO summary tables: all / top 10
+SN_overlap_GO_DAR_all <- do.call(rbind, lapply(unlist(SN_overlap_GO_DAR, recursive = FALSE), as.data.frame))
+SN_overlap_GO_DAR_top <- SN_overlap_GO_DAR_all %>% arrange(p.adjust) %>% group_by(direction) %>% slice_head(n=10)
+SN_overlap_GO_DAR_top$GeneRatioNumeric <- sapply(SN_overlap_GO_DAR_top$GeneRatio, function(x) eval(parse(text = x)))
+
+# create DAR gene list
+CTX_overlap_DAR_list <- list(Hyper=CTXoverlap[CTXoverlap$DAR=="Hyper",]$GENE, 
+                 Hypo=CTXoverlap[CTXoverlap$DAR=="Hypo",]$GENE)
+
+CTX_overlap_GO_DAR <- list() 
+for (x in c("Hyper", "Hypo")){
+  print(x)
+  
+  print("GO_Molecular_Function")
+  GO <- enrichGO(CTX_overlap_DAR_list[[x]],
+                    OrgDb = org.Rn.eg.db, keyType = "SYMBOL", 
+                    ont = "MF", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    CTX_overlap_GO_DAR[[x]]$GO_Molecular_Function <- as.data.frame(GO@result)
+    CTX_overlap_GO_DAR[[x]]$GO_Molecular_Function$direction <- x
+    CTX_overlap_GO_DAR[[x]]$GO_Molecular_Function$category <- "Molecular function"
+  }
+  
+  print("GO_Biological_Process")
+  GO <- enrichGO(CTX_overlap_DAR_list[[x]],
+                    OrgDb = org.Rn.eg.db, keyType = "SYMBOL", 
+                    ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    CTX_overlap_GO_DAR[[x]]$GO_Biological_Process <- as.data.frame(GO@result)
+    CTX_overlap_GO_DAR[[x]]$GO_Biological_Process$direction <- x
+    CTX_overlap_GO_DAR[[x]]$GO_Biological_Process$category <- "Biological process"
+  }
+}
+
+# GO summary tables: all / top 10
+CTX_overlap_GO_DAR_all <- do.call(rbind, lapply(unlist(CTX_overlap_GO_DAR, recursive = FALSE), as.data.frame))
+CTX_overlap_GO_DAR_top <- CTX_overlap_GO_DAR_all %>% arrange(p.adjust) %>% group_by(direction) %>% slice_head(n=10)
+CTX_overlap_GO_DAR_top$GeneRatioNumeric <- sapply(CTX_overlap_GO_DAR_top$GeneRatio, function(x) eval(parse(text = x)))
+```
+
+```{r SN unique}
+# calculate normalisation factors
+SNgroup = factor(c(rep("rotenone",5),rep("control",4)))
+SNgroup <- relevel(SNgroup, "control")
+SNdesign <- model.matrix(~SNgroup)
+
+SNpeakList <- DGEList(counts = SNunique_counts, group = SNgroup)
+SNpeak_norm <- calcNormFactors(SNpeakList)
+
+SNDGE_norm_disp <- estimateDisp(SNpeak_norm, SNdesign)
+SNfit <- glmQLFit(SNDGE_norm_disp, SNdesign)
+
+SNqlf <- glmQLFTest(SNfit)
+SN_DAR <- SNqlf$table
+rm(SNDGE_norm_disp, SNfit, SNqlf, SNpeak_norm, SNdesign, SNpeakList)
+
+# order peaks by significance
+SN_DAR$FDR <- p.adjust(SN_DAR$PValue, method="fdr")
+SN_DAR <- SN_DAR[order(SN_DAR$PValue),]
+
+# gene annotation
+SNunique_peaks$ID <- paste(SNunique_peaks$Start, sep=".", SNunique_peaks$End)
+m <- SNunique_peaks$ID %in% SN_annot$ID
+SNunique_peaks <- SNunique_peaks[m,]
+
+SNunique <- merge(SNunique_peaks, SN_annot, by = "ID")
+rownames(SNunique) <- SNunique$Peak
+
+# summary table: add DAR category and sort by p value
+SNunique <- merge(SN_DAR, SNunique[,c(2:6,19:22)], by = "row.names")
+row.names(SNunique) <- SNunique$Row.names
+SNunique <- SNunique[,c(7:10,2:6,12,14)]
+names(SNunique)[c(1,11)] <-  c("chr","GENE")
+SNunique <- SNunique %>% mutate(DAR = ifelse(logFC > 0 & FDR < 0.05, "Hyper",
+              ifelse(logFC < 0 & FDR < 0.05, "Hypo", "non-DAR"))) %>% arrange(PValue)
+SNunique$DAR <- factor(SNunique$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+
+SNunique_plot <- EnhancedVolcano(SNunique, 
+                lab = SNunique$GENE, 
+                x= "logFC", 
+                y = "FDR",
+                ylab = '-log10(FDR)',
+                title = 'DARs unique to SNpc',
+                subtitle = NULL,
+                pCutoff = 0.05,
+                FCcutoff = 0.5,
+                pointSize = 2.0,
+                labSize = 3.5,
+                col=c("#E8C4A2FF","#D8AF39FF","#DE7862FF","#278B9AFF"),
+                boxedLabels = TRUE,
+                drawConnectors = TRUE,
+                widthConnectors = 0.5,
+                xlim = c(-4,4),
+                caption = "")
+
+SNunique_plot <- SNunique_plot + theme_classic() +
+  theme(axis.title = element_text(size = 14),  
+        axis.text = element_text(size = 16),  
+        axis.line.x = element_line(color = "black"),  
+        legend.position = "none",
+        plot.title = element_text(size = 20, hjust = 0.5)) 
+SNunique_plot
+
+SN_unique_DAR_list <- list(Hyper=SNunique[SNunique$DAR=="Hyper",]$GENE, 
+                 Hypo=SNunique[SNunique$DAR=="Hypo",]$GENE)
+
+SN_unique_GO_DAR <- list() 
+for (x in c("Hyper", "Hypo")){
+  print(x)
+  
+  print("GO_Molecular_Function")
+  GO <- enrichGO(SN_unique_DAR_list[[x]],
+                    OrgDb = org.Rn.eg.db, keyType = "SYMBOL", 
+                    ont = "MF", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    SN_unique_GO_DAR[[x]]$GO_Molecular_Function <- as.data.frame(GO@result)
+    SN_unique_GO_DAR[[x]]$GO_Molecular_Function$direction <- x
+    SN_unique_GO_DAR[[x]]$GO_Molecular_Function$category <- "Molecular function"
+  }
+  
+  print("GO_Biological_Process")
+  GO <- enrichGO(SN_unique_DAR_list[[x]],
+                    OrgDb = org.Rn.eg.db, keyType = "SYMBOL", 
+                    ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    SN_unique_GO_DAR[[x]]$GO_Biological_Process <- as.data.frame(GO@result)
+    SN_unique_GO_DAR[[x]]$GO_Biological_Process$direction <- x
+    SN_unique_GO_DAR[[x]]$GO_Biological_Process$category <- "Biological process"
+  }
+}
+
+# GO summary tables: all / top 10
+SN_unique_GO_DAR_all <- do.call(rbind, lapply(unlist(SN_unique_GO_DAR, recursive = FALSE), as.data.frame))
+SN_unique_GO_DAR_top <- SN_unique_GO_DAR_all %>% arrange(p.adjust) %>% group_by(direction) %>% slice_head(n=10)
+SN_unique_GO_DAR_top$GeneRatioNumeric <- sapply(SN_unique_GO_DAR_top$GeneRatio, function(x) eval(parse(text = x)))
+```
+
+```{r cortex unique}
+CTXgroup = factor(c(rep("rotenone", 2), rep("control", 3), rep("rotenone", 2),"control","rotenone"))
+CTXgroup <- relevel(CTXgroup, "control")
+CTXdesign <- model.matrix(~CTXgroup)
+
+CTXpeakList <- DGEList(counts = CTXunique_counts, group = CTXgroup)
+CTXpeak_norm <- calcNormFactors(CTXpeakList)
+
+CTXDGE_norm_disp <- estimateDisp(CTXpeak_norm, CTXdesign)
+CTXfit <- glmQLFit(CTXDGE_norm_disp, CTXdesign)
+
+CTXqlf <- glmQLFTest(CTXfit)
+CTX_DAR <- CTXqlf$table
+rm(CTXDGE_norm_disp, CTXfit, CTXqlf, CTXpeak_norm, CTXdesign, CTXpeakList)
+
+# order peaks by significance
+CTX_DAR$FDR <- p.adjust(CTX_DAR$PValue, method="fdr")
+CTX_DAR <- CTX_DAR[order(CTX_DAR$PValue),]
+
+# gene annotation
+CTXunique_peaks$ID <- paste(CTXunique_peaks$Start, sep=".", CTXunique_peaks$End)
+m <- CTXunique_peaks$ID %in% CTX_annot$ID
+CTXunique_peaks <- CTXunique_peaks[m,]
+
+CTXunique <- merge(CTXunique_peaks, CTX_annot, by = "ID")
+rownames(CTXunique) <- CTXunique$Peak
+
+# summary table: add DAR category and sort by p value
+CTXunique <- merge(CTX_DAR, CTXunique[,c(2:6,19:22)], by = "row.names")
+row.names(CTXunique) <- CTXunique$Row.names
+CTXunique <- CTXunique[,c(7:10,2:6,12,14)]
+names(CTXunique)[c(1,11)] <-  c("chr","GENE")
+CTXunique <- CTXunique %>% mutate(DAR = ifelse(logFC > 0 & FDR < 0.05, "Hyper",
+              ifelse(logFC < 0 & FDR < 0.05, "Hypo", "non-DAR"))) %>% arrange(PValue)
+CTXunique$DAR <- factor(CTXunique$DAR, levels=c("Hyper", "Hypo", "non-DAR"))
+
+CTXunique_plot <- EnhancedVolcano(CTXunique, 
+                lab = CTXunique$GENE, 
+                x= "logFC", 
+                y = "FDR",
+                ylab = '-log10(FDR)',
+                title = 'DARs unique to cortex',
+                subtitle = NULL,
+                pCutoff = 0.05,
+                FCcutoff = 0.5,
+                pointSize = 2.0,
+                labSize = 3.5,
+                col=c("#E8C4A2FF","#D8AF39FF","#DE7862FF","#278B9AFF"),
+                boxedLabels = TRUE,
+                drawConnectors = TRUE,
+                widthConnectors = 0.5,
+                xlim = c(-4,4),
+                caption = "")
+
+CTXunique_plot <- CTXunique_plot + theme_classic() +
+  theme(axis.title = element_text(size = 14),  
+        axis.text = element_text(size = 16),  
+        axis.line.x = element_line(color = "black"),  
+        legend.position = "none",
+        plot.title = element_text(size = 20, hjust = 0.5)) 
+CTXunique_plot
+
+CTX_unique_DAR_list <- list(Hyper=CTXunique[CTXunique$DAR=="Hyper",]$GENE, 
+                 Hypo=CTXunique[CTXunique$DAR=="Hypo",]$GENE)
+
+CTX_unique_GO_DAR <- list() 
+for (x in c("Hyper", "Hypo")){
+  print(x)
+  
+  print("GO_Molecular_Function")
+  GO <- enrichGO(CTX_unique_DAR_list[[x]],
+                    OrgDb = org.Rn.eg.db, keyType = "SYMBOL", 
+                    ont = "MF", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    CTX_unique_GO_DAR[[x]]$GO_Molecular_Function <- as.data.frame(GO@result)
+    CTX_unique_GO_DAR[[x]]$GO_Molecular_Function$direction <- x
+    CTX_unique_GO_DAR[[x]]$GO_Molecular_Function$category <- "Molecular function"
+  }
+  
+  print("GO_Biological_Process")
+  GO <- enrichGO(CTX_unique_DAR_list[[x]],
+                    OrgDb = org.Rn.eg.db, keyType = "SYMBOL", 
+                    ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "fdr", 
+                    universe = NULL, qvalueCutoff = 0.05, 
+                    minGSSize = 10, maxGSSize = 500, readable = FALSE, pool = FALSE)
+  if (nrow(GO@result) > 0) {
+    CTX_unique_GO_DAR[[x]]$GO_Biological_Process <- as.data.frame(GO@result)
+    CTX_unique_GO_DAR[[x]]$GO_Biological_Process$direction <- x
+    CTX_unique_GO_DAR[[x]]$GO_Biological_Process$category <- "Biological process"
+  }
+}
+
+# GO summary tables: all / top 10
+CTX_unique_GO_DAR_all <- do.call(rbind, lapply(unlist(CTX_unique_GO_DAR, recursive = FALSE), as.data.frame))
+CTX_unique_GO_DAR_top <- CTX_unique_GO_DAR_all %>% arrange(p.adjust) %>% group_by(direction) %>% slice_head(n=10)
+CTX_unique_GO_DAR_top$GeneRatioNumeric <- sapply(CTX_unique_GO_DAR_top$GeneRatio, function(x) eval(parse(text = x)))
+```
+
+```{r}
+SN_unique_GO_hyper_plot <- ggplot(SN_unique_GO_DAR_top[SN_unique_GO_DAR_top$direction == "Hyper", ],
+       aes(x = GeneRatioNumeric, y = reorder(Description, -log10(p.adjust)))) +
+  geom_point(aes(size = -log10(p.adjust), color = -log10(p.adjust)), alpha = 0.7) + 
+  scale_color_gradient(low = "#D8AF39FF", high = "#DE7862FF") + # Adjust color gradient as needed
+  scale_size(range = c(1, 10)) + # Adjust size range as needed
+  theme_minimal() + 
+  theme(axis.text.y = element_text(size = 16),
+        axis.title.x = element_text(size = 16),
+        plot.title = element_text(size = 16, hjust = 1, face = "bold"),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 16)) +
+  ggtitle("Enriched hyperacetylated pathways in the cortex") +
+  xlab("Gene Ratio") + ylab("") +
+  guides(size = guide_legend(title = "-log10(FDR)"), color = guide_legend(title = "-log10(FDR)")) +
+  scale_y_discrete(labels = label_wrap_gen(55)) # Adjust wrapping as needed
+
+SN_unique_GO_hyper_plot
+#ggsave("SN_unique_GO_hyper_plot.png", SN_unique_GO_hyper_plot, dpi = 300, height=8, width=12) 
+```
+
+```{r}
+CTX_unique_GO_hyper_plot <- ggplot(CTX_unique_GO_DAR_top[CTX_unique_GO_DAR_top$direction == "Hyper", ],
+       aes(x = GeneRatioNumeric, y = reorder(Description, -log10(p.adjust)))) +
+  geom_point(aes(size = -log10(p.adjust), color = -log10(p.adjust)), alpha = 0.7) + 
+  scale_color_gradient(low = "#D8AF39FF", high = "#DE7862FF") + # Adjust color gradient as needed
+  scale_size(range = c(1, 10)) + # Adjust size range as needed
+  theme_minimal() + 
+  theme(axis.text.y = element_text(size = 16),
+        axis.title.x = element_text(size = 16),
+        plot.title = element_text(size = 16, hjust = 1, face = "bold"),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 16)) +
+  ggtitle("Enriched hyperacetylated pathways in the cortex") +
+  xlab("Gene Ratio") + ylab("") +
+  guides(size = guide_legend(title = "-log10(FDR)"), color = guide_legend(title = "-log10(FDR)")) +
+  scale_y_discrete(labels = label_wrap_gen(55)) # Adjust wrapping as needed
+
+CTX_unique_GO_hyper_plot
+#ggsave("CTX_unique_GO_hyper_plot.png", CTX_unique_GO_hyper_plot, dpi = 300, height=8, width=12) 
+```
